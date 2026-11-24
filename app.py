@@ -1,12 +1,16 @@
 # Data Processing Worker 01
 # 役割: 仕事(JSON)を受け取り、軽い整形・重複除去などの処理をして結果を返す。
 # 外部ライブラリは使わず、Python標準機能だけで動く。
+import hmac
 import json
 import os
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(os.environ.get("SERVER_PORT") or os.environ.get("PORT") or "8080")
+# 合言葉（共有トークン）。環境変数 FACTORY_TOKEN で渡す。
+# 未設定のときは安全側に倒し、仕事の受け付けと結果の返却を止める。
+TOKEN = os.environ.get("FACTORY_TOKEN", "")
 BASE = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(BASE, "results")
 LOG_FILE = os.path.join(BASE, "jobs_log.jsonl")
@@ -57,11 +61,24 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _authorized(self):
+        if not TOKEN:
+            return False
+        given = self.headers.get("X-Factory-Token") or ""
+        return hmac.compare_digest(given, TOKEN)
+
     def do_GET(self):
         if self.path == "/health":
-            self._send(200, {"status": "ok", "role": "worker"})
+            self._send(200, {"status": "ok", "role": "worker",
+                             "auth": bool(TOKEN)})
             return
         if self.path.startswith("/results/"):
+            if not TOKEN:
+                self._send(503, {"error": "FACTORY_TOKEN is not set"})
+                return
+            if not self._authorized():
+                self._send(401, {"error": "unauthorized"})
+                return
             job_id = self.path[len("/results/"):]
             path = os.path.join(RESULTS_DIR, f"{job_id}.json")
             if os.path.exists(path):
@@ -75,6 +92,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path != "/jobs":
             self._send(404, {"error": "not found"})
+            return
+        if not TOKEN:
+            self._send(503, {"error": "FACTORY_TOKEN is not set"})
+            return
+        if not self._authorized():
+            self._send(401, {"error": "unauthorized"})
             return
         length = int(self.headers.get("Content-Length") or 0)
         try:
@@ -97,5 +120,5 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print(f"[worker] starting on port {PORT}", flush=True)
+    print(f"[worker] starting on port {PORT} (auth={'on' if TOKEN else 'OFF - jobs disabled'})", flush=True)
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
